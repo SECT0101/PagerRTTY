@@ -1,0 +1,13 @@
+[Unit]
+Description=PagerRTTY receiver (minimodem -> Node-RED)
+After=sound.target network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/pagerrtty-rx
+ExecStart=/usr/local/bin/pagerrtty-rx.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

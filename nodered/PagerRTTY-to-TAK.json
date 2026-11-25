@@ -1,0 +1,119 @@
+[
+  {
+    "id": "prtty_tab",
+    "type": "tab",
+    "label": "PagerRTTY to TAK",
+    "disabled": false,
+    "info": "Receives decoded PagerRTTY lines over UDP from the PagerRTTY receiver (minimodem) and sends CoT to TAK Server.\nPositions -> a-f-G-U-C marker. SALUTE / SITREP / MSG -> GeoChat (All Chat Rooms).\nChecksum-validated; repeats within 120 s are dropped."
+  },
+  {
+    "id": "prtty_note",
+    "type": "comment",
+    "z": "prtty_tab",
+    "name": "Setup: set the TAK host and cert in the TLS node, UDP port must match NR_PORT on the receiver",
+    "info": "1. Open the 'PagerRTTY cert' TLS config: set the client cert + key (one cert for this feed).\n2. Open 'TAK Server (PagerRTTY)': set your TAK Server host (port 8089).\n3. Receiver: /etc/default/pagerrtty-rx NR_HOST = this Node-RED, NR_PORT = 4545.\n4. Deploy. Send 'Test tones' from the Pager.",
+    "x": 360,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "prtty_udp",
+    "type": "udp in",
+    "z": "prtty_tab",
+    "name": "PagerRTTY RX (UDP 4545)",
+    "iface": "",
+    "port": "4545",
+    "ipv": "udp4",
+    "multicast": "false",
+    "group": "",
+    "datatype": "utf8",
+    "x": 170,
+    "y": 120,
+    "wires": [
+      [
+        "prtty_fn",
+        "prtty_dbg_in"
+      ]
+    ]
+  },
+  {
+    "id": "prtty_fn",
+    "type": "function",
+    "z": "prtty_tab",
+    "name": "Validate + build CoT",
+    "func": "// PagerRTTY line -> CoT. Input msg.payload: \"<rxhost>|DE CALL TYPE [POS lat lon] [TXT text] HHMMZ CKxx\"\nconst STALE_MIN = 30;      // position marker stale (minutes) - set just past your beacon interval\nconst DEDUP_SEC = 120;     // repeats of the same message inside this window are dropped\n\nlet raw = String(msg.payload).trim();\nlet rx = \"rx\";\nconst bar = raw.indexOf(\"|\");\nif (bar >= 0) { rx = raw.slice(0, bar); raw = raw.slice(bar + 1).trim(); }\n\nconst m = raw.match(/DE (\\S+) (LOC|SALUTE|SITREP|MSG|TEST)( POS (\\d{2}\\.\\d{4})([NS]) (\\d{3}\\.\\d{4})([EW]))?( TXT (.*?))? (\\d{4})Z CK([0-9A-F]{2})\\s*$/);\nif (!m) { node.status({fill:\"grey\", shape:\"ring\", text:\"no frame: \" + raw.slice(0, 30)}); return null; }\n\nconst body = raw.slice(raw.indexOf(\"DE \"), raw.lastIndexOf(\" CK\"));\nlet x = 0; for (const ch of body) x ^= ch.charCodeAt(0);\nconst ck = x.toString(16).toUpperCase().padStart(2, \"0\");\nif (ck !== m[11]) { node.status({fill:\"red\", shape:\"dot\", text:\"bad checksum \" + m[1]}); node.warn(\"bad checksum: \" + raw); return null; }\n\nconst seen = context.get(\"seen\") || {};\nconst nowMs = Date.now();\nfor (const k in seen) if (nowMs - seen[k] > DEDUP_SEC * 1000) delete seen[k];\nif (seen[body]) { node.status({fill:\"yellow\", shape:\"ring\", text:\"repeat \" + m[1]}); return null; }\nseen[body] = nowMs; context.set(\"seen\", seen);\n\nconst call = m[1], type = m[2], text = m[9] || \"\", hhmm = m[10];\nconst esc = s => String(s).replace(/&/g, \"&amp;\").replace(/</g, \"&lt;\").replace(/>/g, \"&gt;\").replace(/\"/g, \"&quot;\");\nconst iso = d => d.toISOString();\nconst now = new Date(), stale = new Date(nowMs + STALE_MIN * 60000);\nconst uid = \"PagerRTTY-\" + call;\nconst out = [];\n\nlet lat = null, lon = null;\nif (m[3]) {\n    lat = parseFloat(m[4]) * (m[5] === \"S\" ? -1 : 1);\n    lon = parseFloat(m[6]) * (m[7] === \"W\" ? -1 : 1);\n}\nconst pt = lat === null ? '<point lat=\"0\" lon=\"0\" hae=\"9999999\" ce=\"9999999\" le=\"9999999\"/>'\n                        : `<point lat=\"${lat}\" lon=\"${lon}\" hae=\"9999999\" ce=\"25\" le=\"9999999\"/>`;\n\nif (lat !== null) {\n    out.push(`<event version=\"2.0\" uid=\"${uid}\" type=\"a-f-G-U-C\" how=\"h-e\" time=\"${iso(now)}\" start=\"${iso(now)}\" stale=\"${iso(stale)}\">${pt}` +\n      `<detail><contact callsign=\"${esc(call)}\"/><__group name=\"Cyan\" role=\"Team Member\"/>` +\n      `<remarks>PagerRTTY ${type} ${hhmm}Z via ${esc(rx)}${text ? \" - \" + esc(text) : \"\"}</remarks></detail></event>`);\n}\nif (type !== \"LOC\") {\n    const id = uid + \"-\" + nowMs;\n    const line = `[${type}] ${text}`.trim();\n    out.push(`<event version=\"2.0\" uid=\"GeoChat.${uid}.All Chat Rooms.${id}\" type=\"b-t-f\" how=\"h-g-i-g-o\" time=\"${iso(now)}\" start=\"${iso(now)}\" stale=\"${iso(new Date(nowMs + 86400000))}\">${pt}` +\n      `<detail><__chat parent=\"RootContactGroup\" groupOwner=\"false\" messageId=\"${id}\" chatroom=\"All Chat Rooms\" id=\"All Chat Rooms\" senderCallsign=\"${esc(call)}\">` +\n      `<chatgrp uid0=\"${uid}\" uid1=\"All Chat Rooms\" id=\"All Chat Rooms\"/></__chat>` +\n      `<link uid=\"${uid}\" type=\"a-f-G-U-C\" relation=\"p-p\"/>` +\n      `<remarks source=\"BAO.F.ATAK.${uid}\" to=\"All Chat Rooms\" time=\"${iso(now)}\">${esc(line)}</remarks></detail></event>`);\n}\nnode.status({fill:\"green\", shape:\"dot\", text:`${call} ${type} ${hhmm}Z`});\nreturn [out.map(p => ({payload: p}))];\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 420,
+    "y": 120,
+    "wires": [
+      [
+        "prtty_tak",
+        "prtty_dbg_out"
+      ]
+    ]
+  },
+  {
+    "id": "prtty_tak",
+    "type": "tcp out",
+    "z": "prtty_tab",
+    "name": "TAK Server (PagerRTTY)",
+    "host": "takserver.example.net",
+    "port": "8089",
+    "beserver": "client",
+    "base64": false,
+    "end": false,
+    "tls": "prtty_tls",
+    "x": 680,
+    "y": 120,
+    "wires": []
+  },
+  {
+    "id": "prtty_dbg_in",
+    "type": "debug",
+    "z": "prtty_tab",
+    "name": "Decoded lines",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 400,
+    "y": 180,
+    "wires": []
+  },
+  {
+    "id": "prtty_dbg_out",
+    "type": "debug",
+    "z": "prtty_tab",
+    "name": "CoT out",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 660,
+    "y": 180,
+    "wires": []
+  },
+  {
+    "id": "prtty_tls",
+    "type": "tls-config",
+    "name": "PagerRTTY cert",
+    "cert": "",
+    "key": "",
+    "ca": "",
+    "certname": "",
+    "keyname": "",
+    "caname": "",
+    "servername": "",
+    "verifyservercert": false,
+    "alpnprotocol": ""
+  }
+]
